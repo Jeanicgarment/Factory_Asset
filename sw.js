@@ -1,5 +1,5 @@
 /* Service worker: mở được app khi mất mạng; luôn ưu tiên bản mới nhất khi có mạng. */
-const CACHE = 'factory-asset-v101';
+const CACHE = 'factory-asset-v110';
 self.addEventListener('install', e => { self.skipWaiting(); });
 self.addEventListener('activate', e => {
   e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim()));

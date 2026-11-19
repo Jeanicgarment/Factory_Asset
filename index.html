@@ -141,7 +141,7 @@ const DEFAULT_CLIENT_ID = '30f3356b-fb13-4b82-b2d6-8dcbb3b0003c';
 const DEFAULT_SITE_URL  = 'https://jeanicgarment.sharepoint.com/sites/JEANICGARMENT-Factory_Asset';
 
 const APP_NAME = 'Quản lý Máy móc Nhà xưởng';
-const VERSION  = '1.0.1';
+const VERSION  = '1.1.0';
 const LS_DB    = 'fa_db_v1';
 const LS_CFG   = 'fa_cfg_v1';
 
@@ -223,7 +223,7 @@ function blankDB(){
   return {
     v: 1,
     settings: {
-      company: 'JEANIC GARMENT',
+      company: 'JEANIC GARMENT SOLUTIONS',
       deptName: 'Phòng Cơ điện & Bảo trì',
       prefix: 'MM-',
       codeMode: 'seq',
@@ -236,7 +236,9 @@ function blankDB(){
       docShort: 'CĐ-TB',
       directorName: '',
       directorTitle: 'Giám đốc nhà máy',
-      roles: [] // [{email, role:'admin'|'editor'|'viewer', name}]
+      strictAccess: false,
+      defaultRole: 'viewer',
+      roles: [] // [{email, name, dept, role, active, perms:{...}}]
     },
     workshops: [], // {id, name, lines:[], manager, _spId, _etag}
     machines: [],  // {id, code, name, type, workshop, line, status, brand, model, serial, year, origin, powerKw, voltage, supplier, buyDate, price, deprYears, warrantyEnd, maintMonths, needInspect, caretaker, note, _spId, _etag, updatedAt, updatedBy}
@@ -274,6 +276,7 @@ function normalizeDB(d){
   const b = blankDB();
   const o = Object.assign(b, d||{});
   o.settings = Object.assign(b.settings, (d&&d.settings)||{});
+  if(d&&d.settings&&d.settings._spId){ o.settings._spId=d.settings._spId; o.settings._etag=d.settings._etag||''; }
   if(!Array.isArray(o.settings.roles)) o.settings.roles = [];
   ['workshops','machines','transfers','repairs','maints','inspections','inventories','audit'].forEach(k=>{
     if(!Array.isArray(o[k])) o[k] = [];
@@ -377,22 +380,39 @@ function loadSampleFactoryData(){
 /* =====================================================================
  * SHAREPOINT LISTS + MSAL.JS v2 PKCE + MULTI-USER ONTIME SYNC ENGINE
  * ===================================================================== */
+const ROLE_PRESETS = {
+  admin:   { label:'Quản trị viên (Admin)',     cls:'bad',  perms:{ machine:true, transfer:true, repair:true, inv:true, del:true, admin:true } },
+  manager: { label:'Quản đốc / Trưởng BP',      cls:'acc',  perms:{ machine:true, transfer:true, repair:true, inv:true, del:false, admin:false } },
+  tech:    { label:'Kỹ thuật cơ điện / Kiểm kê',cls:'ok',   perms:{ machine:true, transfer:false, repair:true, inv:true, del:false, admin:false } },
+  editor:  { label:'Kỹ thuật / Biên tập',       cls:'ok',   perms:{ machine:true, transfer:true, repair:true, inv:true, del:false, admin:false } },
+  viewer:  { label:'Chỉ xem (Read-only)',       cls:'info', perms:{ machine:false, transfer:false, repair:false, inv:false, del:false, admin:false } }
+};
+function permsFor(role, custom){
+  const base = (ROLE_PRESETS[role] || ROLE_PRESETS.viewer).perms;
+  return custom ? Object.assign({}, base, custom) : Object.assign({}, base);
+}
+
 const SP = {
   msal: null,
   account: null,
-  user: { name:'Khách (Cục bộ)', email:'local@demo', role:'admin' }, // role: 'admin' | 'editor' | 'viewer'
+  user: { name:'Khách (Cục bộ)', email:'local@demo', role:'admin', perms:permsFor('admin'), blocked:false },
   siteId: null,
   driveId: null,
   listIds: {},
-  state: 'local', // 'local' | 'live' | 'syncing' | 'error' | 'needauth'
+  state: 'local',
   msg: '',
   lastAt: 0,
   pollTimer: null,
   busy: false,
 
-  canEdit(){ return this.user.role === 'admin' || this.user.role === 'editor'; },
-  canAdmin(){ return this.user.role === 'admin'; },
-  roleLabel(){ return {admin:'Quản trị (Admin)', editor:'Kỹ thuật / Biên tập', viewer:'Chỉ xem (Read-only)'}[this.user.role] || 'Chỉ xem'; },
+  can(p){
+    if(this.user.blocked) return false;
+    if(this.user.role === 'admin') return true;
+    return !!(this.user.perms && this.user.perms[p]);
+  },
+  canEdit(){ return this.can('machine') || this.can('repair') || this.can('transfer') || this.can('inv'); },
+  canAdmin(){ return !this.user.blocked && (this.user.role === 'admin' || this.can('admin')); },
+  roleLabel(){ return (ROLE_PRESETS[this.user.role] && ROLE_PRESETS[this.user.role].label) || 'Chỉ xem'; },
 
   async loadMsalScript(){
     if(window.msal) return;
@@ -562,24 +582,46 @@ const SP = {
   },
 
   async detectRole(){
-    // 1. Check explicit role mapping in DB.settings.roles
-    const em = (this.user.email||'').toLowerCase();
-    const mapped = (DB.settings.roles||[]).find(r => (r.email||'').toLowerCase() === em);
-    if(mapped && ['admin','editor','viewer'].includes(mapped.role)){
-      this.user.role = mapped.role;
+    const em = (this.user.email||'').toLowerCase().trim();
+    const roles = DB.settings.roles || [];
+    const hasAnyAdmin = roles.some(r => r.role === 'admin' && r.active !== false);
+    this.user.blocked = false;
+
+    // 1. If no admin exists yet in SharePoint config, bootstrap the current authenticated user as first Admin
+    if(!hasAnyAdmin && em){
+      this.user.role = 'admin';
+      this.user.perms = permsFor('admin');
+      const existing = roles.find(r => (r.email||'').toLowerCase() === em);
+      if(existing){ existing.role = 'admin'; existing.active = true; existing.perms = permsFor('admin'); }
+      else { roles.push({ email:em, name:this.user.name||em, dept:DB.settings.deptName||'', role:'admin', active:true, perms:permsFor('admin') }); }
+      DB.settings.roles = roles;
       return;
     }
-    // 2. Fallback: probe write permission via site permissions or default editor if list exists
-    try{
-      const perms = await this.gFetch(`/sites/${this.siteId}/permissions`).catch(()=>null);
-      if(perms && Array.isArray(perms.value)){
-        // If user can read site permissions, usually Owner/Admin
-        this.user.role = 'admin';
+
+    // 2. Match explicit account in DB.settings.roles
+    const mapped = roles.find(r => (r.email||'').toLowerCase().trim() === em);
+    if(mapped){
+      if(mapped.active === false){
+        this.user.role = 'viewer';
+        this.user.perms = permsFor('viewer');
+        this.user.blocked = true;
         return;
       }
-    }catch{}
-    // Default for authenticated members if not restricted in roles list: check if user can read config; SharePoint itself enforces 403 on write if user is Visitor
-    this.user.role = 'editor';
+      this.user.role = ROLE_PRESETS[mapped.role] ? mapped.role : 'viewer';
+      this.user.perms = permsFor(this.user.role, mapped.perms);
+      return;
+    }
+
+    // 3. Not in list: block if strictAccess is enabled, otherwise apply defaultRole
+    if(DB.settings.strictAccess){
+      this.user.role = 'viewer';
+      this.user.perms = permsFor('viewer');
+      this.user.blocked = true;
+      return;
+    }
+    const defR = ROLE_PRESETS[DB.settings.defaultRole] ? DB.settings.defaultRole : 'viewer';
+    this.user.role = defR;
+    this.user.perms = permsFor(defR);
   },
 
   async syncAll(silent=false){
@@ -695,13 +737,12 @@ const SP = {
 
   async saveSettings(){
     const sItem = Object.assign({ id:'settings' }, DB.settings);
-    const existing = DB.settings._spId;
-    if(existing){ sItem._spId = existing; sItem._etag = DB.settings._etag; }
+    if(DB.settings._spId){ sItem._spId = DB.settings._spId; sItem._etag = DB.settings._etag; }
     persistLocal();
     if(CFG.mode !== 'sp') return;
+    if(!this.siteId) await this.resolveSite();
     const saved = await this.upsertItem('config', sItem);
-    DB.settings._spId = saved._spId;
-    DB.settings._etag = saved._etag;
+    if(saved){ DB.settings._spId = saved._spId; DB.settings._etag = saved._etag; }
     persistLocal();
   },
 
@@ -922,6 +963,7 @@ const NAV = [
   {id:'inventories', label:'Kiểm kê QR',            icon:'clip'},
   {id:'reports',     label:'Báo cáo & Thay thế',    icon:'chart'},
   {id:'audit',       label:'Nhật ký thao tác',      icon:'log'},
+  {id:'accounts',    label:'Tài khoản & Phân quyền',icon:'shield'},
   {id:'settings',    label:'Cài đặt & SharePoint',  icon:'cog'}
 ];
 const TAB_IDS = ['dash','machines','repairs','inventories'];
@@ -933,7 +975,8 @@ const TOP_ACT = {
   maints:      ['maintForm','Ghi nhận bảo trì'],
   inspections: ['inspectForm','Cập nhật kiểm định'],
   workshops:   ['workshopForm','Thêm Xưởng / Khu vực'],
-  inventories: ['invForm','Đợt kiểm kê mới']
+  inventories: ['invForm','Đợt kiểm kê mới'],
+  accounts:    ['accountForm','Thêm tài khoản']
 };
 const fl = () => UI.f[UI.view] || (UI.f[UI.view] = {});
 
@@ -997,7 +1040,7 @@ function renderChrome(){
     return `<button data-act="nav" data-v="${id}" ${id===UI.view?'aria-current="page"':''}>${icon(n.icon,20)}${esc(n.label.split(' ')[0])}</button>`;
   }).join('') + `<button data-act="menu">${icon('menu',20)}Thêm</button>`;
 
-  const canAdd = ta && SP.canEdit();
+  const canAdd = ta && (UI.view==='accounts' ? SP.canAdmin() : SP.canEdit());
   $('#top').innerHTML = `
     <button class="btn icon ghost" id="menuBtn" data-act="menu" aria-label="Mở menu">${icon('menu',20)}</button>
     <h1>${esc(cur.label)}</h1>
@@ -1008,11 +1051,25 @@ function renderChrome(){
 }
 
 function render(){
+  if(SP.user.blocked){
+    renderChrome();
+    $('#view').innerHTML = `<div class="card" style="max-width:520px;margin:40px auto;text-align:center">
+      <div style="color:var(--bad);margin-bottom:8px">${icon('shield',40)}</div>
+      <h2 style="justify-content:center">Tài khoản chưa được cấp quyền truy cập</h2>
+      <p class="muted">Email <b>${esc(SP.user.email)}</b> hiện chưa có trong danh sách tài khoản được phép sử dụng ứng dụng hoặc đã bị tạm khóa.</p>
+      <p class="sm muted">Vui lòng liên hệ Quản trị viên để được thêm vào mục <b>Tài khoản & Phân quyền</b>.</p>
+      <div class="toolbar" style="justify-content:center;margin-top:14px;margin-bottom:0">
+        <button class="btn primary" data-act="syncNow">Kiểm tra lại quyền</button>
+        <button class="btn" data-act="logout">Đăng xuất</button>
+      </div>
+    </div>`;
+    return;
+  }
   renderChrome();
   const V = {
     dash:vDash, machines:vMachines, transfers:vTransfers, stock:vStock,
     repairs:vRepairs, maints:vMaint, inspections:vInspect, workshops:vWorkshops,
-    inventories:vInv, reports:vReports, audit:vAudit, settings:vSettings
+    inventories:vInv, reports:vReports, audit:vAudit, accounts:vAccounts, settings:vSettings
   }[UI.view] || vDash;
   $('#view').innerHTML = `<div id="syncWarn">${syncWarn()}</div>` + V();
   $('#side').classList.remove('open');
@@ -1943,6 +2000,140 @@ function vAudit(){
 /* =====================================================================
  * 12. SETTINGS & SHAREPOINT (CÀI ĐẶT, PHÂN QUYỀN & KẾT NỐI SHAREPOINT)
  * ===================================================================== */
+/* =====================================================================
+ * 11B. ACCOUNTS & ACCESS CONTROL (TÀI KHOẢN & PHÂN QUYỀN TRUY CẬP)
+ * ===================================================================== */
+function vAccounts(){
+  const S = DB.settings;
+  const roles = S.roles || [];
+  const isAdm = SP.canAdmin();
+  const pTag = (ok, txt) => ok ? `<span class="chip ok">${txt}</span>` : '';
+  return `
+    <div class="card">
+      <h2>${icon('shield',18)} Chính sách kiểm soát truy cập ứng dụng</h2>
+      <div class="frm" style="align-items:center">
+        <label class="f full" style="flex-direction:row;align-items:center;gap:10px;color:var(--ink);font-size:14px">
+          <input type="checkbox" id="_chkStrict" ${S.strictAccess?'checked':''} ${isAdm?'':'disabled'}>
+          <span><b>Chỉ cho phép tài khoản có trong danh sách bên dưới truy cập app</b> (Tài khoản ngoài danh sách sẽ bị chặn ngay cả khi có quyền vào SharePoint Site)</span>
+        </label>
+        <label class="f">Vai trò mặc định cho nhân viên chưa có trong danh sách (khi tắt chế độ chặn)
+          <select id="_selDefRole" ${isAdm?'':'disabled'}>
+            <option value="viewer" ${S.defaultRole==='viewer'?'selected':''}>Chỉ xem (Read-only)</option>
+            <option value="tech" ${S.defaultRole==='tech'?'selected':''}>Kỹ thuật cơ điện / Kiểm kê</option>
+            <option value="manager" ${S.defaultRole==='manager'?'selected':''}>Quản đốc / Trưởng BP</option>
+          </select>
+        </label>
+        <div class="f">Hành động
+          <div style="padding-top:2px">${isAdm?`<button class="btn primary" id="_saveAccPolicy">Lưu chính sách truy cập</button>`:'<span class="sm muted">Chỉ Quản trị viên mới được thay đổi chính sách.</span>'}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>${icon('users',18)} Danh sách tài khoản & Phân quyền (${roles.length} tài khoản)
+        ${isAdm?`<button class="btn primary sm" data-act="accountForm">${icon('plus',14)}Thêm tài khoản</button>`:''}
+      </h2>
+      <div class="tw"><table class="tbl">
+        <thead><tr><th>Email Microsoft 365</th><th>Họ tên & Bộ phận</th><th>Vai trò</th><th>Quyền chi tiết</th><th>Trạng thái</th><th class="right">Thao tác</th></tr></thead>
+        <tbody>${roles.length ? roles.map((r,i)=>{
+          const pr = ROLE_PRESETS[r.role] || ROLE_PRESETS.viewer;
+          const pm = permsFor(r.role, r.perms);
+          const tags = [
+            pTag(pm.machine,'Máy móc'), pTag(pm.transfer,'Điều chuyển'),
+            pTag(pm.repair,'Sửa/BT/KĐ'), pTag(pm.inv,'Kiểm kê'),
+            pTag(pm.del,'Xóa'), pTag(pm.admin,'Quản trị')
+          ].filter(Boolean).join(' ') || '<span class="chip info">Chỉ xem</span>';
+          const actv = r.active !== false;
+          return `<tr>
+            <td class="t1 mono" data-l="Email"><b>${esc(r.email)}</b></td>
+            <td data-l="Họ tên"><b>${esc(r.name||'—')}</b><div class="sm muted">${esc(r.dept||'')}</div></td>
+            <td data-l="Vai trò"><span class="chip ${pr.cls}">${esc(pr.label)}</span></td>
+            <td data-l="Quyền">${tags}</td>
+            <td data-l="Trạng thái">${actv?'<span class="chip ok">Hoạt động</span>':'<span class="chip bad">Đã khóa</span>'}</td>
+            <td class="act" data-l="Thao tác">
+              ${isAdm?`<button class="btn sm" data-act="accountForm" data-idx="${i}">Sửa</button>
+              <button class="btn sm" data-act="toggleRole" data-idx="${i}">${actv?'Khóa':'Mở khóa'}</button>
+              <button class="btn sm danger" data-act="delRole" data-idx="${i}">Xóa</button>`:'—'}
+            </td>
+          </tr>`;
+        }).join('') : `<tr><td colspan="6" class="empty">Chưa có tài khoản nào trong danh sách.</td></tr>`}</tbody>
+      </table></div>
+    </div>`;
+}
+
+function openAccountForm(idxStr=''){
+  if(!SP.canAdmin()){ toast('Chỉ Quản trị viên mới được quản lý tài khoản.'); return; }
+  const isEdit = idxStr !== '' && idxStr != null;
+  const idx = isEdit ? +idxStr : -1;
+  const cur = isEdit ? DB.settings.roles[idx] : null;
+  const role = cur ? cur.role : 'tech';
+  const pm = permsFor(role, cur && cur.perms);
+  modal(cur ? `Sửa quyền: ${esc(cur.email)}` : 'Thêm tài khoản & Phân quyền truy cập', `
+    <form id="accFrm" class="frm">
+      <label class="f full">Email Microsoft 365 công ty *
+        <input name="email" type="email" required value="${esc(cur?cur.email:'')}" placeholder="ten.nv@jeanicgarment.com" ${cur?'readonly':''}>
+      </label>
+      <label class="f">Họ và tên<input name="name" value="${esc(cur?cur.name:'')}" placeholder="VD: Nguyễn Văn A"></label>
+      <label class="f">Bộ phận / Xưởng<input name="dept" value="${esc(cur?cur.dept:'')}" placeholder="VD: Cơ điện, Xưởng May 1"></label>
+      <label class="f">Vai trò mẫu
+        <select name="role" id="_accRoleSel">
+          <option value="admin" ${role==='admin'?'selected':''}>Quản trị viên (Toàn quyền)</option>
+          <option value="manager" ${role==='manager'?'selected':''}>Quản đốc / Trưởng BP</option>
+          <option value="tech" ${role==='tech'?'selected':''}>Kỹ thuật cơ điện / Kiểm kê</option>
+          <option value="viewer" ${role==='viewer'?'selected':''}>Chỉ xem (Read-only)</option>
+        </select>
+      </label>
+      <label class="f">Trạng thái tài khoản
+        <select name="active"><option value="1" ${!cur||cur.active!==false?'selected':''}>Hoạt động (Cho phép truy cập)</option><option value="0" ${cur&&cur.active===false?'selected':''}>Tạm khóa (Chặn truy cập)</option></select>
+      </label>
+      <div class="f full" style="border:1px solid var(--line);border-radius:10px;padding:10px;margin-top:4px">
+        <div style="font-weight:600;color:var(--ink);margin-bottom:6px">Tùy chỉnh quyền chi tiết theo chức năng:</div>
+        <div class="grid g2" style="gap:6px;color:var(--ink);font-size:13px">
+          <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" name="p_machine" ${pm.machine?'checked':''}> Thêm / Sửa máy móc</label>
+          <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" name="p_transfer" ${pm.transfer?'checked':''}> Điều chuyển / Bàn giao / Thanh lý</label>
+          <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" name="p_repair" ${pm.repair?'checked':''}> Sửa chữa / Bảo trì / Kiểm định</label>
+          <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" name="p_inv" ${pm.inv?'checked':''}> Tạo & Quét QR kiểm kê</label>
+          <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" name="p_del" ${pm.del?'checked':''}> Xóa máy móc / bản ghi</label>
+          <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" name="p_admin" ${pm.admin?'checked':''}> Quản trị hệ thống & Tài khoản</label>
+        </div>
+      </div>
+    </form>
+  `, `<button class="btn" data-act="closeModal">Hủy</button><button class="btn primary" id="_saveAccBtn">Lưu tài khoản</button>`, {
+    onOpen: el => {
+      $('#_accRoleSel', el).onchange = e => {
+        const p = permsFor(e.target.value);
+        ['machine','transfer','repair','inv','del','admin'].forEach(k=>{ const cb = $(`input[name="p_${k}"]`, el); if(cb) cb.checked = !!p[k]; });
+      };
+      $('#_saveAccBtn', el).onclick = async () => {
+        const frm = $('#accFrm', el); if(!frm.reportValidity()) return;
+        const fd = new FormData(frm);
+        const em = String(fd.get('email')||'').trim().toLowerCase();
+        const rVal = fd.get('role');
+        const active = fd.get('active') === '1';
+        const perms = {
+          machine: !!fd.get('p_machine'), transfer: !!fd.get('p_transfer'),
+          repair: !!fd.get('p_repair'), inv: !!fd.get('p_inv'),
+          del: !!fd.get('p_del'), admin: !!fd.get('p_admin')
+        };
+        const obj = { email:em, name:String(fd.get('name')||'').trim(), dept:String(fd.get('dept')||'').trim(), role:rVal, active, perms };
+        if(isEdit) DB.settings.roles[idx] = obj;
+        else {
+          DB.settings.roles = (DB.settings.roles||[]).filter(x=>(x.email||'').toLowerCase()!==em);
+          DB.settings.roles.push(obj);
+        }
+        closeModal();
+        try{
+          await SP.saveSettings();
+          await SP.detectRole();
+          logAudit(isEdit?'Cập nhật tài khoản':'Thêm tài khoản', em, `${rVal} · ${active?'Hoạt động':'Khóa'}`);
+          toast('Đã lưu tài khoản ' + em + ' lên SharePoint!');
+        }catch(err){ toast('Lỗi lưu lên SharePoint: ' + err.message); }
+        render();
+      };
+    }
+  });
+}
+
 function vSettings(){
   const S = DB.settings;
   const roles = S.roles || [];
@@ -2407,9 +2598,23 @@ document.addEventListener('click', async e => {
   else if(act === 'loadSample'){
     ask('Nạp bộ dữ liệu mẫu nhà xưởng (7 máy móc, kiểm định, bảo trì, kiểm kê)?', ()=>{ loadSampleFactoryData(); toast('Đã nạp dữ liệu mẫu!'); render(); });
   }
+  else if(act === 'accountForm'){ openAccountForm(b.dataset.idx!=null?b.dataset.idx:''); }
+  else if(act === 'toggleRole'){
+    if(!SP.canAdmin()) return;
+    const r = DB.settings.roles[+b.dataset.idx]; if(!r) return;
+    if(r.role==='admin' && r.active!==false && DB.settings.roles.filter(x=>x.role==='admin'&&x.active!==false).length<=1){ toast('Không thể khóa Quản trị viên duy nhất!'); return; }
+    r.active = (r.active === false);
+    await SP.saveSettings().catch(err=>toast('Lỗi lưu: '+err.message));
+    logAudit(r.active?'Mở khóa tài khoản':'Khóa tài khoản', r.email);
+    render();
+  }
   else if(act === 'delRole'){
+    if(!SP.canAdmin()) return;
+    const r = DB.settings.roles[+b.dataset.idx]; if(!r) return;
+    if(r.role==='admin' && DB.settings.roles.filter(x=>x.role==='admin'&&x.active!==false).length<=1){ toast('Không thể xóa Quản trị viên duy nhất!'); return; }
     DB.settings.roles.splice(+b.dataset.idx, 1);
-    await SP.saveSettings().catch(()=>{});
+    await SP.saveSettings().catch(err=>toast('Lỗi lưu: '+err.message));
+    logAudit('Xóa tài khoản', r.email);
     render();
   }
 });
@@ -2458,6 +2663,13 @@ document.addEventListener('click', async e => {
       await SP.syncAll(false);
     }catch(err){ SP.setState('error', 'Lỗi khởi tạo bảng: '+(err.message||err)); toast('Lỗi khởi tạo bảng: '+err.message); render(); }
   }
+  else if(e.target.id === '_saveAccPolicy'){
+    if(!SP.canAdmin()) return;
+    DB.settings.strictAccess = !!$('#_chkStrict').checked;
+    DB.settings.defaultRole  = $('#_selDefRole').value;
+    try{ await SP.saveSettings(); logAudit('Cập nhật chính sách truy cập', DB.settings.strictAccess?'Bật chặn ngoài danh sách':'Mặc định '+DB.settings.defaultRole); toast('Đã lưu chính sách truy cập lên SharePoint!'); }catch(err){ toast('Lỗi lưu: '+err.message); }
+    render();
+  }
   else if(e.target.id === '_saveGenSet'){
     const fd = new FormData($('#genSetFrm'));
     Object.assign(DB.settings, {
@@ -2472,10 +2684,7 @@ document.addEventListener('click', async e => {
       directorTitle: String(fd.get('directorTitle')||'').trim(),
       directorName: String(fd.get('directorName')||'').trim()
     });
-    await SP.saveSettings().catch(()=>{});
-    SP.startPolling();
-    logAudit('Cập nhật cài đặt', 'Cấu hình chung');
-    toast('Đã lưu cài đặt!');
+    try{ await SP.saveSettings(); SP.startPolling(); logAudit('Cập nhật cài đặt', 'Cấu hình chung'); toast('Đã lưu cài đặt lên SharePoint!'); }catch(err){ toast('Lỗi lưu cài đặt: '+err.message); }
     render();
   }
 });
