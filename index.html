@@ -136,12 +136,12 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
 /* =====================================================================
  * CẤU HÌNH MẶC ĐỊNH CÔNG TY (IT điền 1 lần trước khi đẩy lên GitHub Pages)
  * ===================================================================== */
-const DEFAULT_TENANT_ID = ''; // VD: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-const DEFAULT_CLIENT_ID = ''; // VD: 'yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy'
-const DEFAULT_SITE_URL  = ''; // VD: 'https://congty.sharepoint.com/sites/QuanLyMayMoc'
+const DEFAULT_TENANT_ID = '2ce5978a-5d80-4b24-b9ae-e2c87abac1a9';
+const DEFAULT_CLIENT_ID = '30f3356b-fb13-4b82-b2d6-8dcbb3b0003c';
+const DEFAULT_SITE_URL  = 'https://jeanicgarment.sharepoint.com/sites/JEANICGARMENT-Factory_Asset';
 
 const APP_NAME = 'Quản lý Máy móc Nhà xưởng';
-const VERSION  = '1.0.0';
+const VERSION  = '1.0.1';
 const LS_DB    = 'fa_db_v1';
 const LS_CFG   = 'fa_cfg_v1';
 
@@ -223,7 +223,7 @@ function blankDB(){
   return {
     v: 1,
     settings: {
-      company: 'CÔNG TY CỦA BẠN',
+      company: 'JEANIC GARMENT',
       deptName: 'Phòng Cơ điện & Bảo trì',
       prefix: 'MM-',
       codeMode: 'seq',
@@ -256,13 +256,17 @@ let UI  = { view:'dash', tab:{}, f:{}, spBannerOff:false };
 function loadCfg(){
   let c = {};
   try{ c = JSON.parse(localStorage.getItem(LS_CFG)||'{}')||{}; }catch{}
-  return Object.assign({
+  const out = Object.assign({
     tenantId: DEFAULT_TENANT_ID,
     clientId: DEFAULT_CLIENT_ID,
     siteUrl:  DEFAULT_SITE_URL,
-    mode:     'none', // 'sp' | 'demo' | 'none'
+    mode:     'none',
     view:     'dash'
   }, c);
+  if(!out.tenantId) out.tenantId = DEFAULT_TENANT_ID;
+  if(!out.clientId) out.clientId = DEFAULT_CLIENT_ID;
+  if(!out.siteUrl)  out.siteUrl  = DEFAULT_SITE_URL;
+  return out;
 }
 function saveCfg(){ try{ localStorage.setItem(LS_CFG, JSON.stringify(CFG)); }catch{} }
 
@@ -433,28 +437,30 @@ const SP = {
 
   scopes(){ return ['User.Read', 'Sites.ReadWrite.All']; },
 
-  async getToken(interactive=false){
+  async getToken(interactive=false, customScopes=null){
     if(!this.msal) await this.initMsal();
     if(!this.account){
       if(!interactive) throw new Error('NEED_LOGIN');
-      const r = await this.msal.loginPopup({ scopes: this.scopes(), prompt:'select_account' });
+      const sc = customScopes || this.scopes();
+      const r = await this.msal.loginPopup({ scopes: sc, prompt:'select_account' });
       this.account = r.account;
       this.user.name  = this.account.name || this.account.username;
       this.user.email = (this.account.username||'').toLowerCase();
       return r.accessToken;
     }
     try{
-      const r = await this.msal.acquireTokenSilent({ scopes: this.scopes(), account: this.account });
+      const sc = customScopes || this.scopes();
+      const r = await this.msal.acquireTokenSilent({ scopes: sc, account: this.account });
       return r.accessToken;
     }catch(e){
       if(!interactive) throw new Error('NEED_LOGIN');
-      const r = await this.msal.acquireTokenPopup({ scopes: this.scopes(), account: this.account });
+      const r = await this.msal.acquireTokenPopup({ scopes: sc, account: this.account });
       return r.accessToken;
     }
   },
 
   async gFetch(path, opts={}){
-    const tok = await this.getToken(!!opts.interactive);
+    const tok = await this.getToken(!!opts.interactive, opts.scopes||null);
     const headers = Object.assign({ 'Authorization': 'Bearer ' + tok }, opts.headers||{});
     if(opts.body && !(opts.body instanceof ArrayBuffer) && !(opts.body instanceof Blob) && !headers['Content-Type']){
       headers['Content-Type'] = 'application/json';
@@ -513,11 +519,11 @@ const SP = {
           { name:'Status',    text:{} },
           { name:'UpdatedBy', text:{} },
           { name:'UpdatedAt', text:{} },
-          { name:'Payload',   text:{ allowMultipleLines:true, maxLength:100000 } }
+          { name:'Payload',   text:{ allowMultipleLines:true, textType:'plain' } }
         ],
         list: { template: 'genericList' }
       };
-      const res = await this.gFetch(`/sites/${this.siteId}/lists`, { method:'POST', body: JSON.stringify(body) });
+      const res = await this.gFetch(`/sites/${this.siteId}/lists`, { method:'POST', interactive:true, scopes:['Sites.Manage.All'], body: JSON.stringify(body) });
       this.listIds[name] = res.id;
       created.push(name);
     }
@@ -584,8 +590,9 @@ const SP = {
       if(!this.siteId) await this.resolveSite();
       const missing = Object.values(SP_LISTS).filter(n => !this.listIds[n]);
       if(missing.length){
-        this.setState('error', `Thiếu ${missing.length} bảng trên SharePoint. Vào Cài đặt để khởi tạo tự động.`);
+        this.setState('error', `Đã nối Site thành công nhưng thiếu ${missing.length}/9 bảng trên SharePoint. Bấm "Khởi tạo 9 bảng SharePoint Lists tự động" để tạo.`);
         this.busy = false;
+        if(!silent) render();
         return;
       }
       const [machines, transfers, repairs, maints, inspections, workshops, inventories, audit, configs] = await Promise.all([
@@ -1960,7 +1967,8 @@ function vSettings(){
         ${CFG.mode==='sp'?`<button class="btn" id="_btnProvisionSP">${icon('plus',15)}Khởi tạo 9 bảng SharePoint Lists tự động</button>`:''}
         ${CFG.mode==='sp'?`<button class="btn" data-act="syncNow">${icon('refresh',15)}Đồng bộ ngay</button>`:''}
       </div>
-      ${CFG.mode==='sp'&&SP.siteId?`<p class="sm muted" style="margin:8px 0 0">${missingLists.length?`Còn thiếu ${missingLists.length} bảng: ${missingLists.join(', ')}. Bấm nút "Khởi tạo 9 bảng SharePoint Lists tự động" ở trên.`:'✓ Đã đủ 9/9 bảng SharePoint Lists và sẵn sàng hoạt động đa người dùng.'}</p>`:''}
+      ${SP.msg?`<div class="banner ${SP.state==='error'||SP.state==='needauth'?'bad':'info'}" style="margin-top:10px;margin-bottom:0">${icon('alert',17)}<div class="grow sm">${esc(SP.msg)}</div></div>`:''}
+      ${CFG.mode==='sp'&&SP.siteId?`<p class="sm muted" style="margin:8px 0 0">${missingLists.length?`✓ Đã kết nối SharePoint Site. Còn thiếu ${missingLists.length} bảng: ${missingLists.join(', ')}. Bấm nút "Khởi tạo 9 bảng SharePoint Lists tự động" ở trên.`:'✓ Đã đủ 9/9 bảng SharePoint Lists và sẵn sàng hoạt động đa người dùng.'}</p>`:''}
     </div>
 
     <div class="card">
@@ -2440,7 +2448,7 @@ document.addEventListener('click', async e => {
       await SP.initMsal(); await SP.getToken(true); await SP.resolveSite();
       await SP.syncAll(false); SP.startPolling();
       toast('Đã kết nối SharePoint thành công!');
-    }catch(err){ toast('Lỗi kết nối: '+err.message); }
+    }catch(err){ SP.setState('error', err.message||String(err)); toast('Lỗi kết nối: '+err.message); render(); }
   }
   else if(e.target.id === '_btnProvisionSP'){
     toast('Đang tạo các bảng SharePoint Lists…');
@@ -2448,7 +2456,7 @@ document.addEventListener('click', async e => {
       const created = await SP.provisionLists();
       toast(created.length ? `Đã tạo xong ${created.length} bảng trên SharePoint!` : 'Tất cả 9 bảng đã tồn tại trên SharePoint.');
       await SP.syncAll(false);
-    }catch(err){ toast('Lỗi khởi tạo bảng: '+err.message); }
+    }catch(err){ SP.setState('error', 'Lỗi khởi tạo bảng: '+(err.message||err)); toast('Lỗi khởi tạo bảng: '+err.message); render(); }
   }
   else if(e.target.id === '_saveGenSet'){
     const fd = new FormData($('#genSetFrm'));
